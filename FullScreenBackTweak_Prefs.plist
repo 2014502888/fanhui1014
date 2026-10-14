@@ -1,0 +1,7 @@
+{
+  "Filter": {
+    "Mode": "Include",
+    "Bundles": ["com.apple.Preferences"]
+  },
+  "PreferenceBundle": "FullScreenBackTweak.bundle"
+}

@@ -1,0 +1,28 @@
+name: Build Tweak
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install THEOS and deps
+        run: |
+          brew install ldid
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+      - name: Build
+        run: |
+          export THEOS=$HOME/theos
+          make package FINALPACKAGE=1
+          mkdir -p out
+          find .theos packages -name '*.deb' -exec cp {} out/ \;
+          ls -la out/
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: FullScreenBackTweak-deb
+          path: out/*.deb
+          if-no-files-found: error

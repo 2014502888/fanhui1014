@@ -1,0 +1,6 @@
+{
+  "Filter": {
+    "Mode": "Include",
+    "Bundles": ["*"]
+  }
+}
