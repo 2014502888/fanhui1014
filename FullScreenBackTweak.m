@@ -85,6 +85,12 @@ static double FBSGetStrength(void){ return [[NSUserDefaults standardUserDefaults
     UIPanGestureRecognizer *p = (id)g;
     UINavigationController *nav = [self navOf:g.view];
     if (!nav || nav.viewControllers.count < 2) return NO;
+    // 系统边缘返回手势被禁用（导航栈无可 pop 页面时 UIKit 自动禁用 interactivePopGestureRecognizer）
+    // 此时全屏手势也不应开始：否则手势 Ended 仍会向系统过渡 handleNavigationTransition: 发消息，
+    // 空栈 pop 导致 UIKit 动画状态错乱 -> 主线程卡死
+    if (!nav.interactivePopGestureRecognizer.enabled) return NO;
+    // pop/push 转场动画进行中禁止再次触发返回手势，防止连续快速滑动时动画重叠卡死
+    if (nav.transitionCoordinator && nav.transitionCoordinator.isAnimated) return NO;
     CGPoint t = [p translationInView:g.view];
     if (t.x < 2) return NO;
     if (fabs(t.x) < fabs(t.y)) return NO;
