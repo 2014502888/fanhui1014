@@ -13,16 +13,18 @@ jobs:
           brew install ldid
           git clone --recursive https://github.com/theos/theos.git $HOME/theos
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
-      - name: Build
+      - name: Build dylib
         run: |
           export THEOS=$HOME/theos
-          make package FINALPACKAGE=1
+          # FINALPACKAGE=1：Theos 用 -Os 优化并 strip 调试符号，体积小
+          make FINALPACKAGE=1
           mkdir -p out
-          find .theos packages -name '*.deb' -exec cp {} out/ \;
+          # Theos 编译产物路径：.theos/obj/debug/arm64/*.dylib（FINALPACKAGE 后为 release 目录）
+          find .theos -name '*.dylib' -exec cp {} out/ \;
           ls -la out/
-      - name: Upload deb
+      - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
-          name: FullScreenBackTweak-deb
-          path: out/*.deb
+          name: FullScreenBackTweak-dylib
+          path: out/*.dylib
           if-no-files-found: error
