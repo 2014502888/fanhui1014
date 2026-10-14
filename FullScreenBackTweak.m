@@ -131,13 +131,11 @@ static UINavigationController *FBSNavOf(UIView *v) {
 - (void)track:(UIPanGestureRecognizer *)g {
     UINavigationController *nav = FBSNavOf(g.view);
     if (g.state != UIGestureRecognizerStateBegan) return;
-    // 二次校验：识别器已激活，若此刻栈底/导航栏隐藏/转场进行中，强制重置（触摸取消，不驱动系统转场）
+    // 二次校验：只检查 Began 瞬间不会因"系统 target 先启动转场"而误伤的项。
+    // 注意：绝不能在此查 _isTransitioning / animationKeys——手势 action 调用顺序是先系统
+    // target（handleNavigationTransition:，转场已启动、_isTransitioning 已变 YES）再执行本方法，
+    // 查它们必然误判"转场进行中"并强制重置 -> 转场被取消 -> 一闪而过不返回。
     if (!nav || nav.viewControllers.count < 2 || nav.navigationBarHidden) { g.enabled = NO; g.enabled = YES; return; }
-    @try {
-        id tr = [nav valueForKey:@"_isTransitioning"];
-        if (tr && [tr boolValue]) { g.enabled = NO; g.enabled = YES; return; }
-    } @catch (__unused NSException *e) {}
-    if (nav.view.layer.animationKeys.count > 0) { g.enabled = NO; g.enabled = YES; return; }
 }
 @end
 // ==================== 安装手势 ====================
