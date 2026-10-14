@@ -19,11 +19,8 @@ jobs:
           # FINALPACKAGE=1：Theos 用 -Os 优化并 strip 调试符号，体积小
           make FINALPACKAGE=1
           mkdir -p out
-          # 取全部 dylib 产物并强制 thin arm64（TrollFools 内置 ldid 不认 fat，
-          # 对 arm64+arm64e 双架构报 "Unsupported Mach-O type"；lipo 对 thin 输入直接复制）
-          find .theos -name '*.dylib' | while read f; do
-            lipo -thin arm64 "$f" -output "out/$(basename "$f")"
-          done
+          # Makefile ARCHS=arm64 直接产出 thin dylib，直接拷贝即可（lipo 对 thin 输入反而报错）
+          find .theos -name '*.dylib' -exec cp {} out/ \;
           ls -la out/
       - name: Upload dylib
         uses: actions/upload-artifact@v4
