@@ -2,9 +2,30 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <math.h>
+#include <stdarg.h>
 // ==================== 常量（无设置项：总开、震动默认开、力度1.0满格） ====================
 #define FBS_STRENGTH 1.0
 static void FBSInstallOnNav(UINavigationController *nav); // 前置声明（verify兜底里会调用）
+// ==================== 诊断日志（Console可见 + 写微信Documents/fbs_debug.log，可用3uTools导出） ====================
+static void FBSLog(NSString *fmt, ...) {
+    @try {
+        va_list ap; va_start(ap, fmt);
+        NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+        va_end(ap);
+        NSLog(@"[FullScreenBack] %@", msg);
+        NSString *path = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                          stringByAppendingPathComponent:@"fbs_debug.log"];
+        NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (!fh) {
+            [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        } else {
+            [fh seekToEndOfFile];
+            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        }
+    } @catch (NSException *e) {}
+}
 // ==================== 全屏手势 ====================
 @interface FBSPanGesture : UIPanGestureRecognizer
 @end
@@ -78,7 +99,8 @@ static void FBSInstallOnNav(UINavigationController *nav); // 前置声明（veri
     if (![g isKindOfClass:[UIPanGestureRecognizer class]]) return NO;
     UIPanGestureRecognizer *p = (id)g;
     UINavigationController *nav = [self navOf:g.view];
-    if (!nav || nav.viewControllers.count < 2) return NO;
+    if (!nav) { FBSLog(@"shouldBegin REJECT: no nav"); return NO; }
+    if (nav.viewControllers.count < 2) { FBSLog(@"shouldBegin REJECT: stack=%lu", (unsigned long)nav.viewControllers.count); return NO; }
     CGPoint t = [p translationInView:g.view];
     if (t.x < 2) return NO;
     if (fabs(t.x) < fabs(t.y)) return NO;
@@ -104,7 +126,11 @@ static void FBSInstallOnNav(UINavigationController *nav); // 前置声明（veri
         if (!nav2 || !nav2.view.window) return; // 界面已不在
         if (nav2.transitionCoordinator) return; // 系统转场动画进行中，交给系统完成
         if (nav2.viewControllers.count == before && nav2.viewControllers.count > 1) {
-            // 隔离系统边缘手势，防止它补刀造成双pop；pop后恢复并重装手势对齐target
+            FBSLog(@"verify FALLBACK pop nav=%@ stack=%lu", nav2, (unsigned long)before);
+            // 先移除我们自己的手势（系统转场驱动器不再被驱动），再禁系统边缘手势，杜绝任何延迟补刀造成双pop
+            for (UIGestureRecognizer *g in [nav2.view.gestureRecognizers copy]) {
+                if ([g isMemberOfClass:[FBSPanGesture class]]) [nav2.view removeGestureRecognizer:g];
+            }
             UIGestureRecognizer *sysPop = nav2.interactivePopGestureRecognizer;
             BOOL wasEnabled = sysPop.enabled;
             sysPop.enabled = NO;
@@ -128,6 +154,7 @@ static void FBSInstallOnNav(UINavigationController *nav); // 前置声明（veri
     if (tx < w * 0.35 && vx <= 300) return;
     UINavigationController *nav = [self navOf:g.view];
     if (!nav || nav.viewControllers.count < 2) return;
+    FBSLog(@"SELFPOP nav=%@ stack=%lu", nav, (unsigned long)nav.viewControllers.count);
     [nav popViewControllerAnimated:YES];
 }
 @end
@@ -186,6 +213,8 @@ static id FSBTransitionTarget(UINavigationController *nav) {
 }
 static void FBSInstallOnNav(UINavigationController *nav) {
     @try {
+        // 转场进行中不碰手势（_layoutTopViewController在转场中频繁触发，此时移除重装会打断转场导致双pop）
+        if (nav.transitionCoordinator) return;
         // 找已装手势
         FBSPanGesture *existing = nil;
         for (UIGestureRecognizer *g in nav.view.gestureRecognizers) {
@@ -204,12 +233,14 @@ static void FBSInstallOnNav(UINavigationController *nav) {
             [gesture addTarget:[FBSHaptic shared] action:@selector(track:)];
             [gesture addTarget:[FBSDelegate shared] action:@selector(verify:)];
             [nav.view addGestureRecognizer:gesture];
+            FBSLog(@"INSTALL selfPop fallback nav=%@ stack=%lu", nav, (unsigned long)nav.viewControllers.count);
             return;
         }
         
         // 幂等：已装手势且 target 没变就不动（频繁删改手势会打断UIKit触摸分发导致卡死）
         if (existing) {
             if (FBSTargetOf(existing) == target) return;
+            FBSLog(@"REINSTALL target changed nav=%@", nav);
             [nav.view removeGestureRecognizer:existing];
         }
         
@@ -220,6 +251,7 @@ static void FBSInstallOnNav(UINavigationController *nav) {
         [gesture addTarget:[FBSHaptic shared] action:@selector(track:)];
         [gesture addTarget:[FBSDelegate shared] action:@selector(verify:)];
         [nav.view addGestureRecognizer:gesture];
+        FBSLog(@"INSTALL systemTarget nav=%@ stack=%lu", nav, (unsigned long)nav.viewControllers.count);
     } @catch (NSException *e) {}
 }
 // ==================== Hook _layoutTopViewController（WCPulse的安装时机：每次导航栏布局必调，天然幂等懒加载） ====================
