@@ -51,6 +51,7 @@
 @interface FBSDelegate : NSObject <UIGestureRecognizerDelegate>
 + (instancetype)shared;
 - (void)verify:(UIPanGestureRecognizer *)g;
+- (void)selfPop:(UIPanGestureRecognizer *)g;
 @end
 @implementation FBSDelegate
 + (instancetype)shared {
@@ -95,14 +96,37 @@
     if (!nav || nav.viewControllers.count < 2) return;
     NSUInteger before = nav.viewControllers.count;
     __weak UINavigationController *wnav = nav;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // 等1.2s：覆盖系统转场驱动器延迟响应的窗口，避免兜底pop与系统补刀造成双pop
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UINavigationController *nav2 = wnav;
         if (!nav2 || !nav2.view.window) return; // 界面已不在
-        if (nav2.transitionCoordinator) return; // 系统转场动画进行中，交给系统完成，不兜底（防止双pop）
+        if (nav2.transitionCoordinator) return; // 系统转场动画进行中，交给系统完成
         if (nav2.viewControllers.count == before && nav2.viewControllers.count > 1) {
+            // 隔离系统边缘手势，防止它补刀造成双pop；pop后恢复并重装手势对齐target
+            UIGestureRecognizer *sysPop = nav2.interactivePopGestureRecognizer;
+            BOOL wasEnabled = sysPop.enabled;
+            sysPop.enabled = NO;
             [nav2 popViewControllerAnimated:YES];
+            __weak UINavigationController *wnav3 = nav2;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                UINavigationController *nv = wnav3;
+                if (!nv) return;
+                nv.interactivePopGestureRecognizer.enabled = wasEnabled;
+                FBSInstallOnNav(nv);
+            });
         }
     });
+}
+// 自实现返回：系统转场驱动器拿不到时的兜底（资料页等特殊页面，非跟手，达标直接pop）
+- (void)selfPop:(UIPanGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateEnded) return;
+    CGFloat w = [UIScreen mainScreen].bounds.size.width;
+    CGFloat tx = [g translationInView:g.view].x;
+    CGFloat vx = [g velocityInView:g.view].x;
+    if (tx < w * 0.35 && vx <= 300) return;
+    UINavigationController *nav = [self navOf:g.view];
+    if (!nav || nav.viewControllers.count < 2) return;
+    [nav popViewControllerAnimated:YES];
 }
 @end
 // ==================== 安装手势 ====================
@@ -114,17 +138,29 @@ static id FBSTargetOf(UIGestureRecognizer *g) {
 }
 static void FBSInstallOnNav(UINavigationController *nav) {
     @try {
-        // 拿系统当前最新的转场驱动器target
-        UIGestureRecognizer *sys = nav.interactivePopGestureRecognizer;
-        id target = FBSTargetOf(sys);
-        // 拿不到就不装（宁可不生效，也不装只有震动、会吞触摸的空手势）
-        if (!target) return;
-        
-        // 幂等：已装手势且 target 没变就不动（频繁删改手势会打断UIKit触摸分发导致卡死）
+        // 找已装手势
         FBSPanGesture *existing = nil;
         for (UIGestureRecognizer *g in nav.view.gestureRecognizers) {
             if ([g isMemberOfClass:[FBSPanGesture class]]) { existing = (id)g; break; }
         }
+        
+        // 拿系统当前最新的转场驱动器target
+        UIGestureRecognizer *sys = nav.interactivePopGestureRecognizer;
+        id target = FBSTargetOf(sys);
+        if (!target) {
+            // 系统target拿不到（资料页等微信特殊页面）：已有可用手势就保留，否则装自实现返回（非跟手但能用）
+            if (existing) return;
+            FBSPanGesture *gesture = [[FBSPanGesture alloc] initWithTarget:[FBSDelegate shared]
+                                                                   action:@selector(selfPop:)];
+            gesture.delegate = [FBSDelegate shared];
+            gesture.maximumNumberOfTouches = 1;
+            [gesture addTarget:[FBSHaptic shared] action:@selector(track:)];
+            [gesture addTarget:[FBSDelegate shared] action:@selector(verify:)];
+            [nav.view addGestureRecognizer:gesture];
+            return;
+        }
+        
+        // 幂等：已装手势且 target 没变就不动（频繁删改手势会打断UIKit触摸分发导致卡死）
         if (existing) {
             if (FBSTargetOf(existing) == target) return;
             [nav.view removeGestureRecognizer:existing];
