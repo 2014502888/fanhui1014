@@ -120,11 +120,14 @@ static void FBSInstallOnNav(UINavigationController *nav) {
         // 拿不到就不装（宁可不生效，也不装只有震动、会吞触摸的空手势）
         if (!target) return;
         
-        // 先移除所有旧手势，再装一个最新的（杜绝重复安装导致一次滑动触发两次返回）
-        for (UIGestureRecognizer *g in [nav.view.gestureRecognizers copy]) {
-            if ([g isMemberOfClass:[FBSPanGesture class]]) {
-                [nav.view removeGestureRecognizer:g];
-            }
+        // 幂等：已装手势且 target 没变就不动（频繁删改手势会打断UIKit触摸分发导致卡死）
+        FBSPanGesture *existing = nil;
+        for (UIGestureRecognizer *g in nav.view.gestureRecognizers) {
+            if ([g isMemberOfClass:[FBSPanGesture class]]) { existing = (id)g; break; }
+        }
+        if (existing) {
+            if (FBSTargetOf(existing) == target) return;
+            [nav.view removeGestureRecognizer:existing];
         }
         
         FBSPanGesture *gesture = [[FBSPanGesture alloc] initWithTarget:target
@@ -169,20 +172,14 @@ static void FBSHookPopToForClass(Class cls) {
         }));
     }
 }
-// ==================== Hook viewWillAppear（资料页等VC若viewDidAppear未走swizzle链路，这里双保险装上） ====================
-static void FBSHookViewWillAppear(void) {
-    Class vcCls = [UIViewController class];
-    Method m = class_getInstanceMethod(vcCls, @selector(viewWillAppear:));
+// ==================== Hook UINavigationController viewDidAppear（资料页所在nav一旦出现确保装上，幂等不删改） ====================
+static void FBSHookNavViewDidAppear(Class navCls) {
+    Method m = class_getInstanceMethod(navCls, @selector(viewDidAppear:));
     if (m) {
         __block IMP orig = method_getImplementation(m);
         method_setImplementation(m, imp_implementationWithBlock(^(id self, BOOL animated) {
-            ((void(*)(id, SEL, BOOL))orig)(self, @selector(viewWillAppear:), animated);
-            @try {
-                UIViewController *vc = (id)self;
-                if (vc.navigationController) {
-                    FBSInstallOnNav(vc.navigationController);
-                }
-            } @catch (__unused NSException *e) {}
+            ((void(*)(id, SEL, BOOL))orig)(self, @selector(viewDidAppear:), animated);
+            FBSInstallOnNav((id)self);
         }));
     }
 }
@@ -212,14 +209,15 @@ static void FBSInstall(void) {
             FBSHookPushForClass([UINavigationController class]);
             FBSHookSetVCForClass([UINavigationController class]);
             FBSHookPopToForClass([UINavigationController class]);
+            FBSHookNavViewDidAppear([UINavigationController class]);
             // hook微信自定义的MMUINavigationController
             Class mmNavCls = NSClassFromString(@"MMUINavigationController");
             if (mmNavCls) {
                 FBSHookPushForClass(mmNavCls);
                 FBSHookSetVCForClass(mmNavCls);
                 FBSHookPopToForClass(mmNavCls);
+                FBSHookNavViewDidAppear(mmNavCls);
             }
-            FBSHookViewWillAppear();
             FBSHookViewDidAppear();
         }
         
