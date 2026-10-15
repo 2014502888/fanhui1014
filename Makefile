@@ -8,5 +8,5 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = FullScreenBackTweak
 FullScreenBackTweak_FILES = FullScreenBackTweak.m
 FullScreenBackTweak_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function -Wno-error
-FullScreenBackTweak_FRAMEWORKS = UIKit Foundation AudioToolbox
+FullScreenBackTweak_FRAMEWORKS = UIKit Foundation AVFoundation
 include $(THEOS)/makefiles/tweak.mk
