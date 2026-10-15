@@ -189,6 +189,9 @@ static BOOL FSBNavBusy(UINavigationController *nav) {
         UINavigationController *nav = FSBNavForView(g.view);
         if (!nav || nav.viewControllers.count < 2) return NO;
         if (FSBNavBusy(nav)) return NO;
+        // B方案：导航栏隐藏的沉浸式页面（全屏播放器/主页等视觉上"没有返回按钮"的页面）
+        // 不触发全屏返回——这类页面 App 通常自带关闭入口，且 pop 易与 App 自身逻辑冲突
+        if (nav.navigationBarHidden) return NO;
 
         CGPoint t = [pan translationInView:g.view];
         if (t.x <= 2.0) return NO;                    // 必须向右
