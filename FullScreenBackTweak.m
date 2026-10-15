@@ -50,6 +50,7 @@
 // ==================== 手势delegate ====================
 @interface FBSDelegate : NSObject <UIGestureRecognizerDelegate>
 + (instancetype)shared;
+- (void)verify:(UIPanGestureRecognizer *)g;
 @end
 @implementation FBSDelegate
 + (instancetype)shared {
@@ -83,6 +84,25 @@
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)o {
     return NO;
 }
+// 兜底验证：达标滑动结束后，若系统转场没执行（栈深没变），手动pop返回，不用等系统恢复
+- (void)verify:(UIPanGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateEnded) return;
+    CGFloat w = [UIScreen mainScreen].bounds.size.width;
+    CGFloat tx = [g translationInView:g.view].x;
+    CGFloat vx = [g velocityInView:g.view].x;
+    if (tx < w * 0.35 && vx <= 300) return; // 没达标不兜底
+    UINavigationController *nav = [self navOf:g.view];
+    if (!nav || nav.viewControllers.count < 2) return;
+    NSUInteger before = nav.viewControllers.count;
+    __weak UINavigationController *wnav = nav;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UINavigationController *nav2 = wnav;
+        if (!nav2 || !nav2.view.window) return; // 界面已不在
+        if (nav2.viewControllers.count == before && nav2.viewControllers.count > 1) {
+            [nav2 popViewControllerAnimated:YES];
+        }
+    });
+}
 @end
 // ==================== 安装手势 ====================
 // 取手势当前的转场驱动器target（_targets 首个 wrapper 的 _target）
@@ -114,6 +134,7 @@ static void FBSInstallOnNav(UINavigationController *nav) {
         gesture.delegate = [FBSDelegate shared];
         gesture.maximumNumberOfTouches = 1;
         [gesture addTarget:[FBSHaptic shared] action:@selector(track:)];
+        [gesture addTarget:[FBSDelegate shared] action:@selector(verify:)];
         [nav.view addGestureRecognizer:gesture];
     } @catch (NSException *e) {}
 }
@@ -124,6 +145,28 @@ static void FBSHookPushForClass(Class cls) {
         __block IMP orig = method_getImplementation(m);
         method_setImplementation(m, imp_implementationWithBlock(^(id self, UIViewController *vc, BOOL animated) {
             ((void(*)(id, SEL, id, BOOL))orig)(self, @selector(pushViewController:animated:), vc, animated);
+            FBSInstallOnNav((id)self);
+        }));
+    }
+}
+// ==================== Hook setViewControllers（微信换栈路径，如"好友资料→发消息"） ====================
+static void FBSHookSetVCForClass(Class cls) {
+    Method m = class_getInstanceMethod(cls, @selector(setViewControllers:animated:));
+    if (m) {
+        __block IMP orig = method_getImplementation(m);
+        method_setImplementation(m, imp_implementationWithBlock(^(id self, NSArray *vcs, BOOL animated) {
+            ((void(*)(id, SEL, NSArray*, BOOL))orig)(self, @selector(setViewControllers:animated:), vcs, animated);
+            FBSInstallOnNav((id)self);
+        }));
+    }
+}
+// ==================== Hook popToViewController（微信回栈路径） ====================
+static void FBSHookPopToForClass(Class cls) {
+    Method m = class_getInstanceMethod(cls, @selector(popToViewController:animated:));
+    if (m) {
+        __block IMP orig = method_getImplementation(m);
+        method_setImplementation(m, imp_implementationWithBlock(^(id self, UIViewController *vc, BOOL animated) {
+            ((void(*)(id, SEL, id, BOOL))orig)(self, @selector(popToViewController:animated:), vc, animated);
             FBSInstallOnNav((id)self);
         }));
     }
@@ -152,10 +195,14 @@ static void FBSInstall(void) {
             gFBSHooked = YES;
             // hook标准UINavigationController
             FBSHookPushForClass([UINavigationController class]);
+            FBSHookSetVCForClass([UINavigationController class]);
+            FBSHookPopToForClass([UINavigationController class]);
             // hook微信自定义的MMUINavigationController
             Class mmNavCls = NSClassFromString(@"MMUINavigationController");
             if (mmNavCls) {
                 FBSHookPushForClass(mmNavCls);
+                FBSHookSetVCForClass(mmNavCls);
+                FBSHookPopToForClass(mmNavCls);
             }
             FBSHookViewDidAppear();
         }
