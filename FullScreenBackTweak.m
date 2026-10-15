@@ -1,13 +1,8 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-// ==================== 设置存储 ====================
-static NSString *kFBSKeyEnabled = @"fbs_enabled";
-static NSString *kFBSKeyHaptic  = @"fbs_haptic";
-static NSString *kFBSKeyStrength = @"fbs_strength";
-static BOOL FBSGetEnabled(void)   { return [[NSUserDefaults standardUserDefaults] boolForKey:kFBSKeyEnabled] ?: YES; }
-static BOOL FBSGetHaptic(void)    { return [[NSUserDefaults standardUserDefaults] boolForKey:kFBSKeyHaptic] ?: YES; }
-static double FBSGetStrength(void){ return [[NSUserDefaults standardUserDefaults] doubleForKey:kFBSKeyStrength] ?: 0.8; }
+// ==================== 常量（无设置项：总开、震动默认开、力度0.8） ====================
+#define FBS_STRENGTH 0.8
 // ==================== 全屏手势 ====================
 @interface FBSPanGesture : UIPanGestureRecognizer
 @end
@@ -29,7 +24,6 @@ static double FBSGetStrength(void){ return [[NSUserDefaults standardUserDefaults
     return s;
 }
 - (void)track:(UIPanGestureRecognizer *)g {
-    if (!FBSGetHaptic()) return;
     CGFloat w = [UIScreen mainScreen].bounds.size.width;
     switch (g.state) {
         case UIGestureRecognizerStateBegan:
@@ -40,10 +34,7 @@ static double FBSGetStrength(void){ return [[NSUserDefaults standardUserDefaults
             CGFloat tx = [g translationInView:g.view].x;
             CGFloat vx = [g velocityInView:g.view].x;
             if (tx > w * 0.35 || vx > 300) {
-                double s = FBSGetStrength();
-                if (s < 0.01) s = 0.01;
-                if (s > 1.0) s = 1.0;
-                [_gen impactOccurredWithIntensity:s];
+                [_gen impactOccurredWithIntensity:FBS_STRENGTH];
             }
             _gen = nil;
             break;
@@ -80,7 +71,6 @@ static double FBSGetStrength(void){ return [[NSUserDefaults standardUserDefaults
     return nil;
 }
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
-    if (!FBSGetEnabled()) return NO;
     if (![g isKindOfClass:[UIPanGestureRecognizer class]]) return NO;
     UIPanGestureRecognizer *p = (id)g;
     UINavigationController *nav = [self navOf:g.view];
@@ -102,28 +92,21 @@ static void FBSInstallOnNav(UINavigationController *nav) {
             if ([g isMemberOfClass:[FBSPanGesture class]]) return;
         }
         
-        // 方式1: 从interactivePopGestureRecognizer拿target
+        // 从interactivePopGestureRecognizer拿系统的转场驱动器target
         UIGestureRecognizer *sys = nav.interactivePopGestureRecognizer;
         NSArray *targets = [sys valueForKey:@"_targets"];
         id wrapper = targets.firstObject;
         id target = [wrapper valueForKey:@"_target"];
         
-        if (target) {
-            // 用系统的target
-            FBSPanGesture *gesture = [[FBSPanGesture alloc] initWithTarget:target
-                                                                   action:NSSelectorFromString(@"handleNavigationTransition:")];
-            gesture.delegate = [FBSDelegate shared];
-            gesture.maximumNumberOfTouches = 1;
-            [gesture addTarget:[FBSHaptic shared] action:@selector(track:)];
-            [nav.view addGestureRecognizer:gesture];
-        } else {
-            // 方式2: 拿不到target,用自己的处理
-            FBSPanGesture *gesture = [[FBSPanGesture alloc] init];
-            gesture.delegate = [FBSDelegate shared];
-            gesture.maximumNumberOfTouches = 1;
-            [gesture addTarget:[FBSHaptic shared] action:@selector(track:)];
-            [nav.view addGestureRecognizer:gesture];
-        }
+        // 拿不到系统转场驱动器就不装（宁可不生效，也不装只有震动、会吞触摸的空手势）
+        if (!target) return;
+        
+        FBSPanGesture *gesture = [[FBSPanGesture alloc] initWithTarget:target
+                                                               action:NSSelectorFromString(@"handleNavigationTransition:")];
+        gesture.delegate = [FBSDelegate shared];
+        gesture.maximumNumberOfTouches = 1;
+        [gesture addTarget:[FBSHaptic shared] action:@selector(track:)];
+        [nav.view addGestureRecognizer:gesture];
     } @catch (NSException *e) {}
 }
 // ==================== Hook指定类的push方法 ====================
@@ -154,16 +137,20 @@ static void FBSHookViewDidAppear(void) {
         }));
     }
 }
+static BOOL gFBSHooked = NO; // hook 只注册一次，防止 didBecomeActive 反复调用导致嵌套
 static void FBSInstall(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        // hook标准UINavigationController
-        FBSHookPushForClass([UINavigationController class]);
-        // hook微信自定义的MMUINavigationController
-        Class mmNavCls = NSClassFromString(@"MMUINavigationController");
-        if (mmNavCls) {
-            FBSHookPushForClass(mmNavCls);
+        if (!gFBSHooked) {
+            gFBSHooked = YES;
+            // hook标准UINavigationController
+            FBSHookPushForClass([UINavigationController class]);
+            // hook微信自定义的MMUINavigationController
+            Class mmNavCls = NSClassFromString(@"MMUINavigationController");
+            if (mmNavCls) {
+                FBSHookPushForClass(mmNavCls);
+            }
+            FBSHookViewDidAppear();
         }
-        FBSHookViewDidAppear();
         
         // 遍历所有window装手势
         for (UIWindowScene *s in [UIApplication sharedApplication].connectedScenes) {
