@@ -57,19 +57,6 @@ static double FBSGetStrength(void){ return [[NSUserDefaults standardUserDefaults
 }
 @end
 // ==================== 手势delegate ====================
-static UINavigationController *FBSNavOf(UIView *v) {
-    UIResponder *r = v.nextResponder;
-    while (r) {
-        if ([r isKindOfClass:[UINavigationController class]]) return (id)r;
-        if ([r isKindOfClass:[UIViewController class]]) {
-            UIViewController *vc = (id)r;
-            if (vc.navigationController) return vc.navigationController;
-        }
-        r = r.nextResponder;
-    }
-    return nil;
-}
-
 @interface FBSDelegate : NSObject <UIGestureRecognizerDelegate>
 + (instancetype)shared;
 @end
@@ -81,30 +68,23 @@ static UINavigationController *FBSNavOf(UIView *v) {
     return s;
 }
 - (UINavigationController *)navOf:(UIView *)v {
-    return FBSNavOf(v);
+    UIResponder *r = v.nextResponder;
+    while (r) {
+        if ([r isKindOfClass:[UINavigationController class]]) return (id)r;
+        if ([r isKindOfClass:[UIViewController class]]) {
+            UIViewController *vc = (id)r;
+            if (vc.navigationController) return vc.navigationController;
+        }
+        r = r.nextResponder;
+    }
+    return nil;
 }
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
     if (!FBSGetEnabled()) return NO;
     if (![g isKindOfClass:[UIPanGestureRecognizer class]]) return NO;
     UIPanGestureRecognizer *p = (id)g;
-    UINavigationController *nav = FBSNavOf(g.view);
+    UINavigationController *nav = [self navOf:g.view];
     if (!nav || nav.viewControllers.count < 2) return NO;
-    // 系统边缘返回手势被禁用（导航栈无可 pop 页面时 UIKit 自动禁用 interactivePopGestureRecognizer）
-    // 此时全屏手势也不应开始：否则手势 Ended 仍会向系统过渡 handleNavigationTransition: 发消息，
-    // 空栈 pop 导致 UIKit 动画状态错乱 -> 主线程卡死
-    if (!nav.interactivePopGestureRecognizer.enabled) return NO;
-    // 导航栏隐藏的页面（全屏播放器/沉浸式页面等）不触发全屏返回：
-    // 这类页面视觉上"没有返回按钮"，但栈深可能>=2 可被 pop，pop 时 App 自身退出逻辑与 UIKit
-    // 转场交错会挂起 UI（表现为卡死）。这些页面保留系统边缘手势与自带关闭按钮即可。
-    if (nav.navigationBarHidden) return NO;
-    // 私有状态：UIKit 导航过渡/转场进行中（比 transitionCoordinator 更早成立）
-    @try {
-        id tr = [nav valueForKey:@"_isTransitioning"];
-        if (tr && [tr boolValue]) return NO;
-    } @catch (__unused NSException *e) {}
-    // nav.view 上仍有 CAAnimation（push/pop 转场动画播放中）也不应开始
-    if (nav.view.layer.animationKeys.count > 0) return NO;
-    if (nav.transitionCoordinator && nav.transitionCoordinator.isAnimated) return NO;
     CGPoint t = [p translationInView:g.view];
     if (t.x < 2) return NO;
     if (fabs(t.x) < fabs(t.y)) return NO;
@@ -112,30 +92,6 @@ static UINavigationController *FBSNavOf(UIView *v) {
 }
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)o {
     return NO;
-}
-@end
-// ==================== 手势状态守卫 ====================
-// 识别器激活后的二次校验：Began 瞬间再查一次栈深/导航栏/转场状态，
-// 不满足就强制重置（触摸取消），绝不驱动系统 handleNavigationTransition:
-@interface FBSGuard : NSObject
-+ (instancetype)shared;
-- (void)track:(UIPanGestureRecognizer *)g;
-@end
-@implementation FBSGuard
-+ (instancetype)shared {
-    static FBSGuard *s;
-    static dispatch_once_t t;
-    dispatch_once(&t, ^{ s = [FBSGuard new]; });
-    return s;
-}
-- (void)track:(UIPanGestureRecognizer *)g {
-    UINavigationController *nav = FBSNavOf(g.view);
-    if (g.state != UIGestureRecognizerStateBegan) return;
-    // 二次校验：只检查 Began 瞬间不会因"系统 target 先启动转场"而误伤的项。
-    // 注意：绝不能在此查 _isTransitioning / animationKeys——手势 action 调用顺序是先系统
-    // target（handleNavigationTransition:，转场已启动、_isTransitioning 已变 YES）再执行本方法，
-    // 查它们必然误判"转场进行中"并强制重置 -> 转场被取消 -> 一闪而过不返回。
-    if (!nav || nav.viewControllers.count < 2 || nav.navigationBarHidden) { g.enabled = NO; g.enabled = YES; return; }
 }
 @end
 // ==================== 安装手势 ====================
@@ -159,9 +115,6 @@ static void FBSInstallOnNav(UINavigationController *nav) {
             gesture.delegate = [FBSDelegate shared];
             gesture.maximumNumberOfTouches = 1;
             [gesture addTarget:[FBSHaptic shared] action:@selector(track:)];
-            [gesture addTarget:[FBSGuard shared] action:@selector(track:)];
-            // 不设置 requireGestureRecognizerToFail：等待系统手势失败会延迟识别，
-            // 导致"一闪而过没返回"。全屏手势独立驱动转场即可，防转场重叠靠 shouldBegin/Guard 检查。
             [nav.view addGestureRecognizer:gesture];
         } else {
             // 方式2: 拿不到target,用自己的处理
@@ -169,7 +122,6 @@ static void FBSInstallOnNav(UINavigationController *nav) {
             gesture.delegate = [FBSDelegate shared];
             gesture.maximumNumberOfTouches = 1;
             [gesture addTarget:[FBSHaptic shared] action:@selector(track:)];
-            [gesture addTarget:[FBSGuard shared] action:@selector(track:)];
             [nav.view addGestureRecognizer:gesture];
         }
     } @catch (NSException *e) {}
