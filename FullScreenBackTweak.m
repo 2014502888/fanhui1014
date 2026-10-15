@@ -1,8 +1,8 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-// ==================== 常量（无设置项：总开、震动默认开、力度0.8） ====================
-#define FBS_STRENGTH 0.8
+// ==================== 常量（无设置项：总开、震动默认开、力度1.0满格） ====================
+#define FBS_STRENGTH 1.0
 // ==================== 全屏手势 ====================
 @interface FBSPanGesture : UIPanGestureRecognizer
 @end
@@ -85,21 +85,29 @@
 }
 @end
 // ==================== 安装手势 ====================
+// 取手势当前的转场驱动器target（_targets 首个 wrapper 的 _target）
+static id FBSTargetOf(UIGestureRecognizer *g) {
+    NSArray *targets = [g valueForKey:@"_targets"];
+    id wrapper = targets.firstObject;
+    return [wrapper valueForKey:@"_target"];
+}
 static void FBSInstallOnNav(UINavigationController *nav) {
     @try {
-        // 检查有没有装过
-        for (UIGestureRecognizer *g in nav.view.gestureRecognizers) {
-            if ([g isMemberOfClass:[FBSPanGesture class]]) return;
-        }
-        
-        // 从interactivePopGestureRecognizer拿系统的转场驱动器target
+        // 拿系统当前最新的转场驱动器target
         UIGestureRecognizer *sys = nav.interactivePopGestureRecognizer;
-        NSArray *targets = [sys valueForKey:@"_targets"];
-        id wrapper = targets.firstObject;
-        id target = [wrapper valueForKey:@"_target"];
-        
-        // 拿不到系统转场驱动器就不装（宁可不生效，也不装只有震动、会吞触摸的空手势）
+        id target = FBSTargetOf(sys);
+        // 拿不到就不装（宁可不生效，也不装只有震动、会吞触摸的空手势）
         if (!target) return;
+        
+        // 找已装的手势：target 没变就保持不动，变了就移除重装（自愈多次进出后失效）
+        FBSPanGesture *existing = nil;
+        for (UIGestureRecognizer *g in nav.view.gestureRecognizers) {
+            if ([g isMemberOfClass:[FBSPanGesture class]]) { existing = (id)g; break; }
+        }
+        if (existing) {
+            if (FBSTargetOf(existing) == target) return;
+            [nav.view removeGestureRecognizer:existing];
+        }
         
         FBSPanGesture *gesture = [[FBSPanGesture alloc] initWithTarget:target
                                                                action:NSSelectorFromString(@"handleNavigationTransition:")];
