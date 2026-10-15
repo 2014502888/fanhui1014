@@ -98,6 +98,7 @@
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UINavigationController *nav2 = wnav;
         if (!nav2 || !nav2.view.window) return; // 界面已不在
+        if (nav2.transitionCoordinator) return; // 系统转场动画进行中，交给系统完成，不兜底（防止双pop）
         if (nav2.viewControllers.count == before && nav2.viewControllers.count > 1) {
             [nav2 popViewControllerAnimated:YES];
         }
@@ -119,14 +120,11 @@ static void FBSInstallOnNav(UINavigationController *nav) {
         // 拿不到就不装（宁可不生效，也不装只有震动、会吞触摸的空手势）
         if (!target) return;
         
-        // 找已装的手势：target 没变就保持不动，变了就移除重装（自愈多次进出后失效）
-        FBSPanGesture *existing = nil;
-        for (UIGestureRecognizer *g in nav.view.gestureRecognizers) {
-            if ([g isMemberOfClass:[FBSPanGesture class]]) { existing = (id)g; break; }
-        }
-        if (existing) {
-            if (FBSTargetOf(existing) == target) return;
-            [nav.view removeGestureRecognizer:existing];
+        // 先移除所有旧手势，再装一个最新的（杜绝重复安装导致一次滑动触发两次返回）
+        for (UIGestureRecognizer *g in [nav.view.gestureRecognizers copy]) {
+            if ([g isMemberOfClass:[FBSPanGesture class]]) {
+                [nav.view removeGestureRecognizer:g];
+            }
         }
         
         FBSPanGesture *gesture = [[FBSPanGesture alloc] initWithTarget:target
@@ -171,6 +169,23 @@ static void FBSHookPopToForClass(Class cls) {
         }));
     }
 }
+// ==================== Hook viewWillAppear（资料页等VC若viewDidAppear未走swizzle链路，这里双保险装上） ====================
+static void FBSHookViewWillAppear(void) {
+    Class vcCls = [UIViewController class];
+    Method m = class_getInstanceMethod(vcCls, @selector(viewWillAppear:));
+    if (m) {
+        __block IMP orig = method_getImplementation(m);
+        method_setImplementation(m, imp_implementationWithBlock(^(id self, BOOL animated) {
+            ((void(*)(id, SEL, BOOL))orig)(self, @selector(viewWillAppear:), animated);
+            @try {
+                UIViewController *vc = (id)self;
+                if (vc.navigationController) {
+                    FBSInstallOnNav(vc.navigationController);
+                }
+            } @catch (__unused NSException *e) {}
+        }));
+    }
+}
 // ==================== Hook viewDidAppear ====================
 static void FBSHookViewDidAppear(void) {
     Class vcCls = [UIViewController class];
@@ -204,6 +219,7 @@ static void FBSInstall(void) {
                 FBSHookSetVCForClass(mmNavCls);
                 FBSHookPopToForClass(mmNavCls);
             }
+            FBSHookViewWillAppear();
             FBSHookViewDidAppear();
         }
         
