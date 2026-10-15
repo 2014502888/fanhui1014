@@ -6,6 +6,7 @@
 // ==================== 常量（无设置项：总开、震动默认开、力度1.0满格） ====================
 #define FBS_STRENGTH 1.0
 static void FBSInstallOnNav(UINavigationController *nav); // 前置声明（verify兜底里会调用）
+static SEL FBSHandleTransitionSEL(void); // 前置声明（drive:里会调用）
 // ==================== 诊断日志（Console可见 + 写微信Documents/fbs_debug.log，可用3uTools导出） ====================
 static void FBSLog(NSString *fmt, ...) {
     @try {
@@ -74,7 +75,7 @@ static void FBSLog(NSString *fmt, ...) {
 @interface FBSDelegate : NSObject <UIGestureRecognizerDelegate>
 + (instancetype)shared;
 - (void)verify:(UIPanGestureRecognizer *)g;
-- (void)selfPop:(UIPanGestureRecognizer *)g;
+- (void)drive:(UIPanGestureRecognizer *)g;
 @end
 @implementation FBSDelegate
 + (instancetype)shared {
@@ -145,17 +146,35 @@ static void FBSLog(NSString *fmt, ...) {
         }
     });
 }
-// 自实现返回：系统转场驱动器拿不到时的兜底（资料页等特殊页面，非跟手，达标直接pop）
-- (void)selfPop:(UIPanGestureRecognizer *)g {
-    if (g.state != UIGestureRecognizerStateEnded) return;
-    CGFloat w = [UIScreen mainScreen].bounds.size.width;
-    CGFloat tx = [g translationInView:g.view].x;
-    CGFloat vx = [g velocityInView:g.view].x;
-    if (tx < w * 0.35 && vx <= 300) return;
+// 动态驱动：每次手势状态变化现取导航最新的系统转场驱动器转发handleNavigationTransition:
+// 根治target过期（资料页等页面push后驱动器更新，静态绑定的旧target不响应，系统边缘手势却总是最新的）
+- (void)drive:(UIPanGestureRecognizer *)g {
     UINavigationController *nav = [self navOf:g.view];
-    if (!nav || nav.viewControllers.count < 2) return;
-    FBSLog(@"SELFPOP nav=%@ stack=%lu", nav, (unsigned long)nav.viewControllers.count);
-    [nav popViewControllerAnimated:YES];
+    if (!nav) return;
+    SEL handle = FBSHandleTransitionSEL();
+    // 现取系统边缘手势的最新转场驱动器（资料页上它一定有效）
+    id target = nil;
+    @try {
+        UIGestureRecognizer *sys = nav.interactivePopGestureRecognizer;
+        id targets = [sys valueForKey:@"_targets"];
+        if ([targets isKindOfClass:[NSArray class]] && [targets count] > 0) {
+            id wrapper = [targets objectAtIndex:0];
+            target = [wrapper valueForKey:@"_target"];
+            if (![target respondsToSelector:handle]) target = nil;
+        }
+    } @catch (NSException *e) {}
+    if (target) {
+        ((void (*)(id, SEL, id))objc_msgSend)(target, handle, g);
+    } else if (g.state == UIGestureRecognizerStateEnded) {
+        // 最新驱动器也拿不到：达标直接自实现pop（非跟手但能用）
+        CGFloat w = [UIScreen mainScreen].bounds.size.width;
+        CGFloat tx = [g translationInView:g.view].x;
+        CGFloat vx = [g velocityInView:g.view].x;
+        if ((tx > w * 0.35 || vx > 300) && nav.viewControllers.count > 1) {
+            FBSLog(@"SELFPOP nav=%@ stack=%lu", nav, (unsigned long)nav.viewControllers.count);
+            [nav popViewControllerAnimated:YES];
+        }
+    }
 }
 @end
 // ==================== 安装手势 ====================
@@ -164,94 +183,23 @@ static SEL FBSHandleTransitionSEL(void) {
     dispatch_once(&t, ^{ s = NSSelectorFromString(@"handleNavigationTransition:"); });
     return s;
 }
-// 取手势当前的转场驱动器target（_targets 首个 wrapper 的 _target）
-static id FBSTargetOf(UIGestureRecognizer *g) {
-    NSArray *targets = [g valueForKey:@"_targets"];
-    id wrapper = targets.firstObject;
-    return [wrapper valueForKey:@"_target"];
-}
-// 三级取系统交互式转场驱动器（WCPulse 首选 _cachedInteractionController，回退 _targets，再回退类扫描）
-static id FSBTransitionTarget(UINavigationController *nav) {
-    SEL handle = FBSHandleTransitionSEL();
-    // 路径A：nav 私有 _cachedInteractionController（WCPulse 实际用的，资料页也能拿到）
-    @try {
-        SEL cached = NSSelectorFromString(@"_cachedInteractionController");
-        if ([nav respondsToSelector:cached]) {
-            id ic = ((id (*)(id, SEL))objc_msgSend)(nav, cached);
-            if (ic && [ic respondsToSelector:handle]) return ic;
-        }
-    } @catch (NSException *e) {}
-    // 路径B：系统交互式pop手势的 _targets[0]._target
-    @try {
-        UIGestureRecognizer *sys = nav.interactivePopGestureRecognizer;
-        if (sys) {
-            id targets = [sys valueForKey:@"_targets"];
-            if ([targets isKindOfClass:[NSArray class]] && [targets count] > 0) {
-                id wrapper = [targets objectAtIndex:0];
-                id t = [wrapper valueForKey:@"_target"];
-                if (t && [t respondsToSelector:handle]) return t;
-                if (wrapper && [wrapper respondsToSelector:handle]) return wrapper;
-            }
-        }
-    } @catch (NSException *e) {}
-    // 路径C：nav.view 手势里扫描 _UINavigationInteractiveTransition 实例
-    @try {
-        Class itc = NSClassFromString(@"_UINavigationInteractiveTransition");
-        if (itc) {
-            for (UIGestureRecognizer *gr in nav.view.gestureRecognizers) {
-                id targets = [gr valueForKey:@"_targets"];
-                if (![targets isKindOfClass:[NSArray class]]) continue;
-                for (id wrapper in targets) {
-                    id t = [wrapper valueForKey:@"_target"];
-                    if (!t) t = wrapper;
-                    if ([t isKindOfClass:itc] && [t respondsToSelector:handle]) return t;
-                }
-            }
-        }
-    } @catch (NSException *e) {}
-    return nil;
-}
 static void FBSInstallOnNav(UINavigationController *nav) {
     @try {
-        // 转场进行中不碰手势（_layoutTopViewController在转场中频繁触发，此时移除重装会打断转场导致双pop）
+        // 转场进行中不碰手势（_layoutTopViewController在转场中频繁触发，此时增删手势会打断转场导致双pop）
         if (nav.transitionCoordinator) return;
-        // 找已装手势
-        FBSPanGesture *existing = nil;
+        // 幂等：已装过就不再装（target固定为FBSDelegate，永不重装，杜绝重复手势/转场中重装）
         for (UIGestureRecognizer *g in nav.view.gestureRecognizers) {
-            if ([g isMemberOfClass:[FBSPanGesture class]]) { existing = (id)g; break; }
+            if ([g isMemberOfClass:[FBSPanGesture class]]) return;
         }
         
-        // 三级取系统当前最新的转场驱动器target
-        id target = FSBTransitionTarget(nav);
-        if (!target) {
-            // 三级都拿不到（特殊页面）：已有可用手势就保留，否则装自实现返回（非跟手但能用）
-            if (existing) return;
-            FBSPanGesture *gesture = [[FBSPanGesture alloc] initWithTarget:[FBSDelegate shared]
-                                                                   action:@selector(selfPop:)];
-            gesture.delegate = [FBSDelegate shared];
-            gesture.maximumNumberOfTouches = 1;
-            [gesture addTarget:[FBSHaptic shared] action:@selector(track:)];
-            [gesture addTarget:[FBSDelegate shared] action:@selector(verify:)];
-            [nav.view addGestureRecognizer:gesture];
-            FBSLog(@"INSTALL selfPop fallback nav=%@ stack=%lu", nav, (unsigned long)nav.viewControllers.count);
-            return;
-        }
-        
-        // 幂等：已装手势且 target 没变就不动（频繁删改手势会打断UIKit触摸分发导致卡死）
-        if (existing) {
-            if (FBSTargetOf(existing) == target) return;
-            FBSLog(@"REINSTALL target changed nav=%@", nav);
-            [nav.view removeGestureRecognizer:existing];
-        }
-        
-        FBSPanGesture *gesture = [[FBSPanGesture alloc] initWithTarget:target
-                                                               action:NSSelectorFromString(@"handleNavigationTransition:")];
+        FBSPanGesture *gesture = [[FBSPanGesture alloc] initWithTarget:[FBSDelegate shared]
+                                                               action:@selector(drive:)];
         gesture.delegate = [FBSDelegate shared];
         gesture.maximumNumberOfTouches = 1;
         [gesture addTarget:[FBSHaptic shared] action:@selector(track:)];
         [gesture addTarget:[FBSDelegate shared] action:@selector(verify:)];
         [nav.view addGestureRecognizer:gesture];
-        FBSLog(@"INSTALL systemTarget nav=%@ stack=%lu", nav, (unsigned long)nav.viewControllers.count);
+        FBSLog(@"INSTALL drive nav=%@ stack=%lu", nav, (unsigned long)nav.viewControllers.count);
     } @catch (NSException *e) {}
 }
 // ==================== Hook _layoutTopViewController（WCPulse的安装时机：每次导航栏布局必调，天然幂等懒加载） ====================
