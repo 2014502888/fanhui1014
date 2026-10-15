@@ -1,8 +1,10 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#include <math.h>
 // ==================== 常量（无设置项：总开、震动默认开、力度1.0满格） ====================
 #define FBS_STRENGTH 1.0
+static void FBSInstallOnNav(UINavigationController *nav); // 前置声明（verify兜底里会调用）
 // ==================== 全屏手势 ====================
 @interface FBSPanGesture : UIPanGestureRecognizer
 @end
@@ -130,11 +132,57 @@
 }
 @end
 // ==================== 安装手势 ====================
+static SEL FBSHandleTransitionSEL(void) {
+    static SEL s; static dispatch_once_t t;
+    dispatch_once(&t, ^{ s = NSSelectorFromString(@"handleNavigationTransition:"); });
+    return s;
+}
 // 取手势当前的转场驱动器target（_targets 首个 wrapper 的 _target）
 static id FBSTargetOf(UIGestureRecognizer *g) {
     NSArray *targets = [g valueForKey:@"_targets"];
     id wrapper = targets.firstObject;
     return [wrapper valueForKey:@"_target"];
+}
+// 三级取系统交互式转场驱动器（WCPulse 首选 _cachedInteractionController，回退 _targets，再回退类扫描）
+static id FSBTransitionTarget(UINavigationController *nav) {
+    SEL handle = FBSHandleTransitionSEL();
+    // 路径A：nav 私有 _cachedInteractionController（WCPulse 实际用的，资料页也能拿到）
+    @try {
+        SEL cached = NSSelectorFromString(@"_cachedInteractionController");
+        if ([nav respondsToSelector:cached]) {
+            id ic = ((id (*)(id, SEL))objc_msgSend)(nav, cached);
+            if (ic && [ic respondsToSelector:handle]) return ic;
+        }
+    } @catch (NSException *e) {}
+    // 路径B：系统交互式pop手势的 _targets[0]._target
+    @try {
+        UIGestureRecognizer *sys = nav.interactivePopGestureRecognizer;
+        if (sys) {
+            id targets = [sys valueForKey:@"_targets"];
+            if ([targets isKindOfClass:[NSArray class]] && [targets count] > 0) {
+                id wrapper = [targets objectAtIndex:0];
+                id t = [wrapper valueForKey:@"_target"];
+                if (t && [t respondsToSelector:handle]) return t;
+                if (wrapper && [wrapper respondsToSelector:handle]) return wrapper;
+            }
+        }
+    } @catch (NSException *e) {}
+    // 路径C：nav.view 手势里扫描 _UINavigationInteractiveTransition 实例
+    @try {
+        Class itc = NSClassFromString(@"_UINavigationInteractiveTransition");
+        if (itc) {
+            for (UIGestureRecognizer *gr in nav.view.gestureRecognizers) {
+                id targets = [gr valueForKey:@"_targets"];
+                if (![targets isKindOfClass:[NSArray class]]) continue;
+                for (id wrapper in targets) {
+                    id t = [wrapper valueForKey:@"_target"];
+                    if (!t) t = wrapper;
+                    if ([t isKindOfClass:itc] && [t respondsToSelector:handle]) return t;
+                }
+            }
+        }
+    } @catch (NSException *e) {}
+    return nil;
 }
 static void FBSInstallOnNav(UINavigationController *nav) {
     @try {
@@ -144,11 +192,10 @@ static void FBSInstallOnNav(UINavigationController *nav) {
             if ([g isMemberOfClass:[FBSPanGesture class]]) { existing = (id)g; break; }
         }
         
-        // 拿系统当前最新的转场驱动器target
-        UIGestureRecognizer *sys = nav.interactivePopGestureRecognizer;
-        id target = FBSTargetOf(sys);
+        // 三级取系统当前最新的转场驱动器target
+        id target = FSBTransitionTarget(nav);
         if (!target) {
-            // 系统target拿不到（资料页等微信特殊页面）：已有可用手势就保留，否则装自实现返回（非跟手但能用）
+            // 三级都拿不到（特殊页面）：已有可用手势就保留，否则装自实现返回（非跟手但能用）
             if (existing) return;
             FBSPanGesture *gesture = [[FBSPanGesture alloc] initWithTarget:[FBSDelegate shared]
                                                                    action:@selector(selfPop:)];
@@ -174,6 +221,17 @@ static void FBSInstallOnNav(UINavigationController *nav) {
         [gesture addTarget:[FBSDelegate shared] action:@selector(verify:)];
         [nav.view addGestureRecognizer:gesture];
     } @catch (NSException *e) {}
+}
+// ==================== Hook _layoutTopViewController（WCPulse的安装时机：每次导航栏布局必调，天然幂等懒加载） ====================
+static void FBSHookLayoutTopForClass(Class cls) {
+    SEL sel = NSSelectorFromString(@"_layoutTopViewController");
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return; // 私有方法不存在（系统改名）就跳过，不添加空实现
+    __block IMP orig = method_getImplementation(m);
+    method_setImplementation(m, imp_implementationWithBlock(^(id self) {
+        ((void (*)(id, SEL))orig)(self, sel);
+        FBSInstallOnNav((id)self);
+    }));
 }
 // ==================== Hook指定类的push方法 ====================
 static void FBSHookPushForClass(Class cls) {
@@ -242,6 +300,7 @@ static void FBSInstall(void) {
         if (!gFBSHooked) {
             gFBSHooked = YES;
             // hook标准UINavigationController
+            FBSHookLayoutTopForClass([UINavigationController class]);
             FBSHookPushForClass([UINavigationController class]);
             FBSHookSetVCForClass([UINavigationController class]);
             FBSHookPopToForClass([UINavigationController class]);
@@ -249,6 +308,7 @@ static void FBSInstall(void) {
             // hook微信自定义的MMUINavigationController
             Class mmNavCls = NSClassFromString(@"MMUINavigationController");
             if (mmNavCls) {
+                FBSHookLayoutTopForClass(mmNavCls);
                 FBSHookPushForClass(mmNavCls);
                 FBSHookSetVCForClass(mmNavCls);
                 FBSHookPopToForClass(mmNavCls);
@@ -262,10 +322,12 @@ static void FBSInstall(void) {
             if (![s isKindOfClass:[UIWindowScene class]]) continue;
             for (UIWindow *w in s.windows) {
                 if (w.rootViewController) {
-                    NSMutableArray *queue = [NSMutableArray arrayWithObject:w.rootViewController];
-                    while (queue.count > 0) {
-                        UIViewController *vc = queue.firstObject;
-                        [queue removeObjectAtIndex:0];
+                    NSMutableArray *queue = [NSMutableArray array];
+                    [queue addObject:w.rootViewController];
+                    NSUInteger qi = 0;
+                    while (qi < queue.count) {
+                        UIViewController *vc = [queue objectAtIndex:qi];
+                        qi++;
                         if ([vc isKindOfClass:[UINavigationController class]]) {
                             FBSInstallOnNav((id)vc);
                         }
