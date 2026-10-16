@@ -4,20 +4,103 @@
 #include <math.h>
 
 // ============================================================================
-//  FullScreenBackTweak 精简核心版
-//  只保留核心/稳定性功能：
-//    - 绑系统转场 target（跟手返回）
-//    - 手势幂等安装 + 单指 + cancelsTouchesInView=NO
-//    - 判定：栈≥2 / 转场中不响应 / 模态不响应 / 方向过滤
-//    - 全量遍历安装（window→tab→split→child→presented）
-//    - @try 防护
-//    - pushViewController + UIViewController viewDidAppear 双 hook
-//  已剔除：设置项 / 重试 / 左边缘让位 / ScrollView 让位 / 系统边缘手势禁用检查 /
-//          通知重装 / 冗余 hook(viewDidLoad/setViewControllers) / 字符串拼接 / 日志
-//  震动：恒开、满格 1.0（无设置项）
+//  FullScreenBackTweak —— Telegram 移植融合版
+//  判定逻辑完整移植 Telegram Display.InteractiveTransitionGestureRecognizer：
+//    - 方向系统（左/右/中心/边缘/下滑）
+//    - 页面禁用树（disables/Now/Test 递归 superview，strict 全禁/some 降级边缘）
+//    - 边缘让位（左边缘必须配 rightEdge，自动让位给系统边缘返回）
+//    - 10pt 主导方向状态机（validatedGesture + fireBegan）
+//  保留本 tweak 优势：
+//    - 绑定系统转场 target（handleNavigationTransition:，跟手动画）
+//    - 震动恒开满格 1.0
+//    - 全量遍历 + pushViewController/viewDidAppear 双 hook + 幂等安装
 // ============================================================================
 
-// -------------------- 震动（恒开满格） --------------------
+// -------------------- 方向（Telegram InteractiveTransitionGestureRecognizerDirections） --------------------
+typedef NS_OPTIONS(NSUInteger, FSBDirections) {
+    FSBDirectionsLeftEdge    = 1 << 2,
+    FSBDirectionsRightEdge   = 1 << 3,
+    FSBDirectionsLeftCenter  = 1 << 0,
+    FSBDirectionsRightCenter = 1 << 1,
+    FSBDirectionsDown        = 1 << 4,
+    FSBDirectionsLeft  = FSBDirectionsLeftEdge  | FSBDirectionsLeftCenter,
+    FSBDirectionsRight = FSBDirectionsRightEdge | FSBDirectionsRightCenter,
+};
+
+// -------------------- 边缘宽度（Telegram InteractiveTransitionGestureRecognizerEdgeWidth） --------------------
+typedef NS_ENUM(NSInteger, FSBEdgeWidthMode) {
+    FSBEdgeWidthConstant,
+    FSBEdgeWidthMultiplier,
+};
+@interface FSBEdgeWidth : NSObject
+@property (nonatomic) FSBEdgeWidthMode mode;
+@property (nonatomic) CGFloat constantValue;
+@property (nonatomic) CGFloat factor, minValue, maxValue;
++ (instancetype)constant:(CGFloat)value;
++ (instancetype)widthMultiplierWithFactor:(CGFloat)factor min:(CGFloat)min max:(CGFloat)max;
+- (CGFloat)valueForWidth:(CGFloat)width;
+@end
+@implementation FSBEdgeWidth
++ (instancetype)constant:(CGFloat)value {
+    FSBEdgeWidth *e = [FSBEdgeWidth new];
+    e.mode = FSBEdgeWidthConstant;
+    e.constantValue = value;
+    return e;
+}
++ (instancetype)widthMultiplierWithFactor:(CGFloat)factor min:(CGFloat)min max:(CGFloat)max {
+    FSBEdgeWidth *e = [FSBEdgeWidth new];
+    e.mode = FSBEdgeWidthMultiplier;
+    e.factor = factor;
+    e.minValue = min;
+    e.maxValue = max;
+    return e;
+}
+- (CGFloat)valueForWidth:(CGFloat)width {
+    if (self.mode == FSBEdgeWidthConstant) return self.constantValue;
+    return MAX(self.minValue, MIN(width * self.factor, self.maxValue));
+}
+@end
+
+// -------------------- UIView 页面禁用机制（Telegram disablesInteractiveTransitionGestureRecognizer） --------------------
+//  关联属性：fsb_disables(NSNumber BOOL) / fsb_disablesNow(block) / fsb_test(block)
+typedef NS_ENUM(NSInteger, FSBHorizontalState) {
+    FSBHorizontalNone,
+    FSBHorizontalSome,   // 降级：只留边缘
+    FSBHorizontalStrict, // 完全禁用
+};
+
+static const void *kFSBDisablesKey   = &kFSBDisablesKey;
+static const void *kFSBDisablesNowKey = &kFSBDisablesNowKey;
+static const void *kFSBTestKey       = &kFSBTestKey;
+
+static FSBHorizontalState FSBHasHorizontalGestures(UIView *view, CGPoint *point) {
+    if (!view) return FSBHorizontalNone;
+
+    BOOL (^nowBlock)(void) = objc_getAssociatedObject(view, kFSBDisablesNowKey);
+    if (nowBlock && nowBlock()) return FSBHorizontalStrict;
+
+    NSNumber *dis = objc_getAssociatedObject(view, kFSBDisablesKey);
+    if (dis && dis.boolValue) return FSBHorizontalSome;
+
+    if (point) {
+        BOOL (^test)(CGPoint) = objc_getAssociatedObject(view, kFSBTestKey);
+        if (test && test(*point)) return FSBHorizontalSome;
+    }
+
+    // 90° 旋转视图（横滚列表）降级——通用化 Telegram ListViewBackingView 检查
+    CGAffineTransform tf = view.transform;
+    double angle = atan2(tf.b, tf.a);
+    double t1 = fabs(angle - M_PI_2), t2 = fabs(angle + M_PI_2), t3 = fabs(angle - M_PI * 1.5);
+    if (t1 < 0.001 || t2 < 0.001 || t3 < 0.001) return FSBHorizontalSome;
+
+    if (view.superview) {
+        CGPoint converted = point ? [view convertPoint:*point toView:view.superview] : CGPointZero;
+        return FSBHasHorizontalGestures(view.superview, point ? &converted : NULL);
+    }
+    return FSBHorizontalNone;
+}
+
+// -------------------- 震动（恒开满格 1.0，保留） --------------------
 @interface FSBHaptics : NSObject
 + (instancetype)shared;
 - (void)trackGesture:(UIPanGestureRecognizer *)g;
@@ -42,11 +125,8 @@
             CGFloat w = host ? host.bounds.size.width : 0.0;
             CGFloat tx = [g translationInView:host].x;
             CGFloat vx = [g velocityInView:host].x;
-            // 达标：滑过屏宽35% 或 快速右滑
             BOOL passed = (w > 0.0 && tx > w * 0.35) || vx > 300.0;
             if (passed) {
-                // 新建即触发，不依赖 Began 时 prepare 的时效（慢滑超时会导致不震）
-                // iOS13+ 用强度可调 API；iOS<13 降级系统震动音
                 if (@available(iOS 13.0, *)) {
                     UIImpactFeedbackGenerator *g2 =
                         [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleHeavy];
@@ -65,12 +145,156 @@
 }
 @end
 
-// -------------------- 手势（子类标记，幂等判断用） --------------------
-@interface FSBFullScreenPan : UIPanGestureRecognizer
-@end
-@implementation FSBFullScreenPan
+// -------------------- 手势（Telegram InteractiveTransitionGestureRecognizer 完整移植） --------------------
+@interface FSBInteractivePan : UIPanGestureRecognizer
+@property (nonatomic, strong) FSBEdgeWidth *edgeWidth;
+@property (nonatomic, copy) FSBDirections (^allowedDirectionsBlock)(CGPoint point);
+@property (nonatomic, readonly) FSBDirections currentAllowedDirections;
+- (void)cancelGesture;
 @end
 
+@implementation FSBInteractivePan {
+    BOOL _validatedGesture;
+    CGPoint _firstLocation;
+    FSBDirections _currentAllowedDirections;
+}
+
+- (instancetype)initWithTarget:(id)target action:(SEL)action {
+    if (self = [super initWithTarget:target action:action]) {
+        _edgeWidth = [FSBEdgeWidth constant:16.0];
+        _allowedDirectionsBlock = ^FSBDirections(CGPoint p) { return FSBDirectionsRight; }; // 默认全屏向右
+        self.maximumNumberOfTouches = 1;
+        self.delaysTouchesBegan = NO;
+    }
+    return self;
+}
+
+- (void)reset {
+    [super reset];
+    _validatedGesture = NO;
+    _currentAllowedDirections = 0;
+}
+
+- (void)cancelGesture {
+    self.state = UIGestureRecognizerStateCancelled;
+}
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    UITouch *touch = [touches anyObject];
+    CGPoint point = [touch locationInView:self.view];
+
+    FSBDirections allowed = self.allowedDirectionsBlock(point);
+    if (allowed == 0) {
+        self.state = UIGestureRecognizerStateFailed;
+        return;
+    }
+
+    [super touchesBegan:touches withEvent:event];
+
+    _firstLocation = point;
+
+    UIView *target = [self.view hitTest:_firstLocation withEvent:event];
+    if (target) {
+        CGPoint converted = [self.view convertPoint:_firstLocation toView:target];
+        FSBHorizontalState hs = FSBHasHorizontalGestures(target, &converted);
+        if (hs != FSBHorizontalNone) {
+            if (allowed & FSBDirectionsDown) {
+                // down 方向不降级
+            } else {
+                if (hs == FSBHorizontalStrict) {
+                    allowed = 0;
+                } else if ((allowed & FSBDirectionsLeftEdge) || (allowed & FSBDirectionsRightEdge)) {
+                    allowed &= ~FSBDirectionsLeftCenter;
+                    allowed &= ~FSBDirectionsRightCenter;
+                }
+            }
+        }
+    }
+
+    if (allowed == 0) {
+        self.state = UIGestureRecognizerStateFailed;
+    } else {
+        _currentAllowedDirections = allowed;
+    }
+}
+
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    UITouch *touch = [touches anyObject];
+    CGPoint location = [touch locationInView:self.view];
+    CGPoint translation = CGPointMake(location.x - _firstLocation.x, location.y - _firstLocation.y);
+
+    CGFloat absX = fabs(translation.x), absY = fabs(translation.y);
+    CGSize size = self.view ? self.view.bounds.size : CGSizeZero;
+
+    BOOL fireBegan = NO;
+
+    if (_currentAllowedDirections & FSBDirectionsDown) {
+        if (!_validatedGesture) {
+            CGFloat total = sqrt(absX * absX + absY * absY);
+            if (total > 10.0) {
+                if (absY >= absX) {
+                    _validatedGesture = YES;
+                } else {
+                    self.state = UIGestureRecognizerStateFailed;
+                }
+            } else if (absX > 2.0 && absX > absY * 2.0) {
+                self.state = UIGestureRecognizerStateFailed;
+            } else if (absY > 2.0 && absX * 2.0 < absY) {
+                _validatedGesture = YES;
+            }
+        }
+    } else {
+        CGFloat edgeWidth = [self.edgeWidth valueForWidth:size.width];
+
+        if (!_validatedGesture) {
+            if (_firstLocation.x < edgeWidth && !(_currentAllowedDirections & FSBDirectionsRightEdge)) {
+                self.state = UIGestureRecognizerStateFailed;
+                return;
+            }
+            if (_firstLocation.x > size.width - edgeWidth && !(_currentAllowedDirections & FSBDirectionsLeftEdge)) {
+                self.state = UIGestureRecognizerStateFailed;
+                return;
+            }
+
+            if ((_currentAllowedDirections & FSBDirectionsRightEdge) && _firstLocation.x < edgeWidth) {
+                _validatedGesture = YES;
+            } else if ((_currentAllowedDirections & FSBDirectionsLeftEdge) && _firstLocation.x > size.width - edgeWidth) {
+                _validatedGesture = YES;
+            } else if (!(_currentAllowedDirections & FSBDirectionsLeftCenter) && translation.x < 0.0) {
+                self.state = UIGestureRecognizerStateFailed;
+            } else if (!(_currentAllowedDirections & FSBDirectionsRightCenter) && translation.x > 0.0) {
+                self.state = UIGestureRecognizerStateFailed;
+            } else {
+                CGFloat total = sqrt(absX * absX + absY * absY);
+                if (total > 10.0) {
+                    if (absX >= absY) {
+                        _validatedGesture = YES;
+                        fireBegan = YES;
+                    } else {
+                        self.state = UIGestureRecognizerStateFailed;
+                    }
+                } else if (absY > 2.0 && absY > absX * 2.0) {
+                    self.state = UIGestureRecognizerStateFailed;
+                } else if (absX > 2.0 && absY * 2.0 < absX) {
+                    _validatedGesture = YES;
+                    fireBegan = YES;
+                }
+            }
+        }
+    }
+
+    if (_validatedGesture) {
+        [super touchesMoved:touches withEvent:event];
+        if (fireBegan) {
+            if (self.state == UIGestureRecognizerStatePossible) {
+                self.state = UIGestureRecognizerStateBegan;
+            }
+        }
+    }
+}
+@end
+
+// -------------------- 导航定位 --------------------
 static UINavigationController *FSBNavForView(UIView *v) {
     UIResponder *r = v;
     while (r) {
@@ -84,7 +308,7 @@ static UINavigationController *FSBNavForView(UIView *v) {
     return nil;
 }
 
-// -------------------- 手势判定（核心检查） --------------------
+// -------------------- 手势 delegate（导航级粗过滤；方向细判交给 touchesMoved） --------------------
 @interface FSBGestureDelegate : NSObject <UIGestureRecognizerDelegate>
 + (instancetype)shared;
 @end
@@ -98,19 +322,12 @@ static UINavigationController *FSBNavForView(UIView *v) {
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
     if (![g isKindOfClass:[UIPanGestureRecognizer class]]) return NO;
 
-    UIPanGestureRecognizer *pan = (UIPanGestureRecognizer *)g;
     UINavigationController *nav = FSBNavForView(g.view);
     if (!nav) return NO;
-    if (nav.viewControllers.count < 2) return NO;          // 栈底不响应
-    if (nav.transitionCoordinator != nil) return NO;       // 转场中不响应
-    if (nav.presentedViewController != nil) return NO;     // 模态盖着不响应
+    if (nav.viewControllers.count < 2) return NO;      // 栈底不响应
+    if (nav.transitionCoordinator != nil) return NO;   // 转场中不响应
+    if (nav.presentedViewController != nil) return NO; // 模态盖着不响应
     if (nav.isBeingDismissed || nav.isBeingPresented) return NO;
-
-    CGPoint t = [pan translationInView:pan.view];
-    if (t.x <= 2.0) return NO;                              // 只认向右
-    CGFloat ax = fabs(t.x), ay = fabs(t.y);
-    if (ax <= ay) return NO;                                // 必须横向为主
-    if (ax > 0.0 && (ay / ax) > 0.98) return NO;            // 不太斜
     return YES;
 }
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
@@ -119,7 +336,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other 
 }
 @end
 
-// -------------------- 系统转场 target（跟手的根本） --------------------
+// -------------------- 系统转场 target（跟手根本，保留） --------------------
 static id FSBSystemTransitionTarget(UINavigationController *nav) {
     UIGestureRecognizer *sys = nav.interactivePopGestureRecognizer;
     if (!sys) return nil;
@@ -156,7 +373,7 @@ static id FSBSystemTransitionTarget(UINavigationController *nav) {
     return nil;
 }
 
-// -------------------- 安装（幂等，target 拿不到则不装） --------------------
+// -------------------- 安装（幂等） --------------------
 static void FSBInstallOnNav(UINavigationController *nav) {
     if (!nav || ![nav isKindOfClass:[UINavigationController class]]) return;
     UIView *host = nav.view;
@@ -164,19 +381,15 @@ static void FSBInstallOnNav(UINavigationController *nav) {
     if (nav.viewControllers.count < 2) return;
 
     for (UIGestureRecognizer *g in host.gestureRecognizers) {
-        if ([g isMemberOfClass:[FSBFullScreenPan class]]) return;   // 已装
+        if ([g isKindOfClass:[FSBInteractivePan class]]) return;   // 已装
     }
 
     id target = FSBSystemTransitionTarget(nav);
     if (!target || ![target respondsToSelector:NSSelectorFromString(@"handleNavigationTransition:")]) return;
 
-    FSBFullScreenPan *pan = [[FSBFullScreenPan alloc] initWithTarget:target
-                                                              action:NSSelectorFromString(@"handleNavigationTransition:")];
+    FSBInteractivePan *pan = [[FSBInteractivePan alloc] initWithTarget:target
+                                                                 action:NSSelectorFromString(@"handleNavigationTransition:")];
     pan.delegate = [FSBGestureDelegate shared];
-    pan.maximumNumberOfTouches = 1;
-    pan.minimumNumberOfTouches = 1;
-    pan.cancelsTouchesInView = NO;
-    pan.delaysTouchesBegan = NO;
     [pan addTarget:[FSBHaptics shared] action:@selector(trackGesture:)];
     [host addGestureRecognizer:pan];
 }
@@ -215,49 +428,42 @@ static void FSBInstallAll(void) {
 }
 
 // -------------------- Hook（runtime swizzle，无 Logos） --------------------
-typedef struct { IMP orig; } FSBSwizzle;
-
-static FSBSwizzle gSwizzle[2];
-static int gSwizzleCount = 0;
-
-static FSBSwizzle *FSBSwizzleMethod(Class cls, SEL sel, IMP newImp) {
-    if (!cls || !sel || !newImp) return NULL;
-    if (gSwizzleCount >= 2) return NULL;
-    FSBSwizzle *slot = &gSwizzle[gSwizzleCount++];
-    slot->orig = NULL;
-
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) {
-        class_addMethod(cls, sel, newImp, "@@:");
-        return slot;
-    }
-    slot->orig = method_getImplementation(m);
-    class_replaceMethod(cls, sel, newImp, method_getTypeEncoding(m));
-    return slot;
-}
+static IMP gSwizzleOrig[2];
 
 #define SW_NAV_PUSH          0
 #define SW_VC_VIEWDIDAPPEAR  1
 
 static void FSB_UINavigationController_pushViewController(id self, SEL _cmd, UIViewController *vc, BOOL animated) {
-    IMP o = gSwizzle[SW_NAV_PUSH].orig;
+    IMP o = gSwizzleOrig[SW_NAV_PUSH];
     if (o) ((void (*)(id, SEL, id, BOOL))o)(self, _cmd, vc, animated);
     FSBInstallOnNav(self);
 }
 static void FSB_UIViewController_viewDidAppear(id self, SEL _cmd, BOOL animated) {
-    IMP o = gSwizzle[SW_VC_VIEWDIDAPPEAR].orig;
+    IMP o = gSwizzleOrig[SW_VC_VIEWDIDAPPEAR];
     if (o) ((void (*)(id, SEL, BOOL))o)(self, _cmd, animated);
     UINavigationController *nav = ((UIViewController *)self).navigationController;
     if (nav) FSBInstallOnNav(nav);
 }
 
+static IMP FSBReplace(Class cls, SEL sel, IMP newImp) {
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) {
+        class_addMethod(cls, sel, newImp, "@@:");
+        return NULL;
+    }
+    IMP orig = method_getImplementation(m);
+    class_replaceMethod(cls, sel, newImp, method_getTypeEncoding(m));
+    return orig;
+}
+
 __attribute__((constructor)) static void FSBEntry(void) {
     @autoreleasepool {
-        Class navCls = objc_getClass("UINavigationController");
-        Class vcCls  = objc_getClass("UIViewController");
-        gSwizzleCount = 0;
-        FSBSwizzleMethod(navCls, sel_registerName("pushViewController:animated:"), (IMP)FSB_UINavigationController_pushViewController);
-        FSBSwizzleMethod(vcCls, sel_registerName("viewDidAppear:"), (IMP)FSB_UIViewController_viewDidAppear);
+        gSwizzleOrig[SW_NAV_PUSH] = FSBReplace(objc_getClass("UINavigationController"),
+                                               sel_registerName("pushViewController:animated:"),
+                                               (IMP)FSB_UINavigationController_pushViewController);
+        gSwizzleOrig[SW_VC_VIEWDIDAPPEAR] = FSBReplace(objc_getClass("UIViewController"),
+                                                       sel_registerName("viewDidAppear:"),
+                                                       (IMP)FSB_UIViewController_viewDidAppear);
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ FSBInstallAll(); });
