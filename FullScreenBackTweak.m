@@ -1,6 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
-#import <objc/message.h>
+#import <AudioToolbox/AudioToolbox.h>
 #include <math.h>
 
 // ============================================================================
@@ -46,9 +46,14 @@
             BOOL passed = (w > 0.0 && tx > w * 0.35) || vx > 300.0;
             if (passed) {
                 // 新建即触发，不依赖 Began 时 prepare 的时效（慢滑超时会导致不震）
-                UIImpactFeedbackGenerator *g2 =
-                    [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleHeavy];
-                [g2 impactOccurredWithIntensity:1.0];
+                // iOS13+ 用强度可调 API；iOS<13 降级系统震动音
+                if (@available(iOS 13.0, *)) {
+                    UIImpactFeedbackGenerator *g2 =
+                        [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleHeavy];
+                    [g2 impactOccurredWithIntensity:1.0];
+                } else {
+                    AudioServicesPlaySystemSound(1519);
+                }
             }
             _gen = nil;
             break;
@@ -210,17 +215,15 @@ static void FSBInstallAll(void) {
 }
 
 // -------------------- Hook（runtime swizzle，无 Logos） --------------------
-typedef struct { Class cls; SEL sel; IMP orig; } FSBSwizzle;
+typedef struct { IMP orig; } FSBSwizzle;
 
-static FSBSwizzle gSwizzle[8];
+static FSBSwizzle gSwizzle[2];
 static int gSwizzleCount = 0;
 
 static FSBSwizzle *FSBSwizzleMethod(Class cls, SEL sel, IMP newImp) {
     if (!cls || !sel || !newImp) return NULL;
-    if (gSwizzleCount >= 8) return NULL;
+    if (gSwizzleCount >= 2) return NULL;
     FSBSwizzle *slot = &gSwizzle[gSwizzleCount++];
-    slot->cls = cls;
-    slot->sel = sel;
     slot->orig = NULL;
 
     Method m = class_getInstanceMethod(cls, sel);
