@@ -3,188 +3,254 @@
 #import <objc/message.h>
 #include <math.h>
 
-// ==================== 全屏手势 ====================
-@interface FBSPanGesture : UIPanGestureRecognizer
-@end
-@implementation FBSPanGesture
-@end
+// ============================================================================
+//  FullScreenBackTweak 精简核心版
+//  只保留核心/稳定性功能：
+//    - 绑系统转场 target（跟手返回）
+//    - 手势幂等安装 + 单指 + cancelsTouchesInView=NO
+//    - 判定：栈≥2 / 转场中不响应 / 模态不响应 / 方向过滤
+//    - 全量遍历安装（window→tab→split→child→presented）
+//    - @try 防护
+//    - pushViewController + UIViewController viewDidAppear 双 hook
+//  已剔除：设置项 / 重试 / 左边缘让位 / ScrollView 让位 / 系统边缘手势禁用检查 /
+//          通知重装 / 冗余 hook(viewDidLoad/setViewControllers) / 字符串拼接 / 日志
+//  震动：恒开、满格 1.0（无设置项）
+// ============================================================================
 
-// ==================== 震动 ====================
-@interface FBSHaptic : NSObject
+// -------------------- 震动（恒开满格） --------------------
+@interface FSBHaptics : NSObject
 + (instancetype)shared;
-- (void)track:(UIPanGestureRecognizer *)g;
+- (void)trackGesture:(UIPanGestureRecognizer *)g;
 @end
-@implementation FBSHaptic
-{
+@implementation FSBHaptics {
     UIImpactFeedbackGenerator *_gen;
 }
 + (instancetype)shared {
-    static FBSHaptic *s;
+    static FSBHaptics *s;
     static dispatch_once_t t;
-    dispatch_once(&t, ^{ s = [FBSHaptic new]; });
+    dispatch_once(&t, ^{ s = [FSBHaptics new]; });
     return s;
 }
-- (void)track:(UIPanGestureRecognizer *)g {
-    // 震动默认开，强度满格1.0，无设置项
-    CGFloat w = [UIScreen mainScreen].bounds.size.width;
+- (void)trackGesture:(UIPanGestureRecognizer *)g {
     switch (g.state) {
         case UIGestureRecognizerStateBegan:
             _gen = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleHeavy];
             [_gen prepare];
             break;
         case UIGestureRecognizerStateEnded: {
-            CGFloat tx = [g translationInView:g.view].x;
-            CGFloat vx = [g velocityInView:g.view].x;
-            if (tx > w * 0.35 || vx > 300) {
-                [_gen impactOccurredWithIntensity:1.0];
-            }
+            UIView *host = g.view;
+            CGFloat w = host ? host.bounds.size.width : 0.0;
+            CGFloat tx = [g translationInView:host].x;
+            CGFloat vx = [g velocityInView:host].x;
+            BOOL passed = (w > 0.0 && tx > w * 0.35) || (vx > 320.0 && tx > 8.0);
+            if (passed) [_gen impactOccurredWithIntensity:1.0];
             _gen = nil;
             break;
         }
-        case UIGestureRecognizerStateCancelled:
-        case UIGestureRecognizerStateFailed:
+        default:
             _gen = nil;
             break;
-        default: break;
     }
 }
 @end
 
-// ==================== 手势delegate ====================
-@interface FBSDelegate : NSObject <UIGestureRecognizerDelegate>
-+ (instancetype)shared;
+// -------------------- 手势（子类标记，幂等判断用） --------------------
+@interface FSBFullScreenPan : UIPanGestureRecognizer
 @end
-@implementation FBSDelegate
-+ (instancetype)shared {
-    static FBSDelegate *s;
-    static dispatch_once_t t;
-    dispatch_once(&t, ^{ s = [FBSDelegate new]; });
-    return s;
-}
-- (UINavigationController *)navOf:(UIView *)v {
-    UIResponder *r = v.nextResponder;
+@implementation FSBFullScreenPan
+@end
+
+static UINavigationController *FSBNavForView(UIView *v) {
+    UIResponder *r = v;
     while (r) {
-        if ([r isKindOfClass:[UINavigationController class]]) return (id)r;
+        if ([r isKindOfClass:[UINavigationController class]]) return (UINavigationController *)r;
         if ([r isKindOfClass:[UIViewController class]]) {
-            UIViewController *vc = (id)r;
+            UIViewController *vc = (UIViewController *)r;
             if (vc.navigationController) return vc.navigationController;
         }
         r = r.nextResponder;
     }
     return nil;
 }
+
+// -------------------- 手势判定（核心检查） --------------------
+@interface FSBGestureDelegate : NSObject <UIGestureRecognizerDelegate>
++ (instancetype)shared;
+@end
+@implementation FSBGestureDelegate
++ (instancetype)shared {
+    static FSBGestureDelegate *s;
+    static dispatch_once_t t;
+    dispatch_once(&t, ^{ s = [FSBGestureDelegate new]; });
+    return s;
+}
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
     if (![g isKindOfClass:[UIPanGestureRecognizer class]]) return NO;
-    UIPanGestureRecognizer *p = (id)g;
-    UINavigationController *nav = [self navOf:g.view];
-    if (!nav || nav.viewControllers.count < 2) return NO;
-    CGPoint t = [p translationInView:g.view];
-    if (t.x < 2) return NO;
-    if (fabs(t.x) < fabs(t.y)) return NO;
+
+    UIPanGestureRecognizer *pan = (UIPanGestureRecognizer *)g;
+    UINavigationController *nav = FSBNavForView(g.view);
+    if (!nav) return NO;
+    if (nav.viewControllers.count < 2) return NO;          // 栈底不响应
+    if (nav.transitionCoordinator != nil) return NO;       // 转场中不响应
+    if (nav.presentedViewController != nil) return NO;     // 模态盖着不响应
+    if (nav.isBeingDismissed || nav.isBeingPresented) return NO;
+
+    CGPoint t = [pan translationInView:pan.view];
+    if (t.x <= 2.0) return NO;                              // 只认向右
+    CGFloat ax = fabs(t.x), ay = fabs(t.y);
+    if (ax <= ay) return NO;                                // 必须横向为主
+    if (ax > 0.0 && (ay / ax) > 0.98) return NO;            // 不太斜
     return YES;
 }
-- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)o {
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
+shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other {
     return NO;
 }
 @end
 
-// ==================== 安装手势 ====================
-static void FBSInstallOnNav(UINavigationController *nav) {
+// -------------------- 系统转场 target（跟手的根本） --------------------
+static id FSBSystemTransitionTarget(UINavigationController *nav) {
+    UIGestureRecognizer *sys = nav.interactivePopGestureRecognizer;
+    if (!sys) return nil;
+
     @try {
-        // 检查有没有装过
-        for (UIGestureRecognizer *g in nav.view.gestureRecognizers) {
-            if ([g isMemberOfClass:[FBSPanGesture class]]) return;
+        id targets = [sys valueForKey:@"_targets"];
+        if ([targets isKindOfClass:[NSArray class]] && [targets count] > 0) {
+            id wrapper = [targets objectAtIndex:0];
+            if (wrapper) {
+                id t = nil;
+                @try { t = [wrapper valueForKey:@"_target"]; } @catch (__unused NSException *e) { }
+                if (t) return t;
+                if ([wrapper respondsToSelector:NSSelectorFromString(@"handleNavigationTransition:")]) return wrapper;
+            }
         }
-        
-        // 方式1: 从interactivePopGestureRecognizer拿target（系统边缘手势的转场驱动器）
-        UIGestureRecognizer *sys = nav.interactivePopGestureRecognizer;
-        NSArray *targets = [sys valueForKey:@"_targets"];
-        id wrapper = targets.firstObject;
-        id target = [wrapper valueForKey:@"_target"];
-        
-        if (target) {
-            // 用系统的target
-            FBSPanGesture *gesture = [[FBSPanGesture alloc] initWithTarget:target
-                                                                   action:NSSelectorFromString(@"handleNavigationTransition:")];
-            gesture.delegate = [FBSDelegate shared];
-            gesture.maximumNumberOfTouches = 1;
-            [gesture addTarget:[FBSHaptic shared] action:@selector(track:)];
-            [nav.view addGestureRecognizer:gesture];
-        } else {
-            // 方式2: 拿不到target,用自己的处理
-            FBSPanGesture *gesture = [[FBSPanGesture alloc] init];
-            gesture.delegate = [FBSDelegate shared];
-            gesture.maximumNumberOfTouches = 1;
-            [gesture addTarget:[FBSHaptic shared] action:@selector(track:)];
-            [nav.view addGestureRecognizer:gesture];
-        }
-    } @catch (NSException *e) {}
-}
+    } @catch (__unused NSException *e) { }
 
-// ==================== Hook指定类的push方法 ====================
-static void FBSHookPushForClass(Class cls) {
-    Method m = class_getInstanceMethod(cls, @selector(pushViewController:animated:));
-    if (m) {
-        __block IMP orig = method_getImplementation(m);
-        method_setImplementation(m, imp_implementationWithBlock(^(id self, UIViewController *vc, BOOL animated) {
-            ((void(*)(id, SEL, id, BOOL))orig)(self, @selector(pushViewController:animated:), vc, animated);
-            FBSInstallOnNav((id)self);
-        }));
-    }
-}
-
-// ==================== Hook viewDidAppear ====================
-static void FBSHookViewDidAppear(void) {
-    Class vcCls = [UIViewController class];
-    Method m = class_getInstanceMethod(vcCls, @selector(viewDidAppear:));
-    if (m) {
-        __block IMP orig = method_getImplementation(m);
-        method_setImplementation(m, imp_implementationWithBlock(^(id self, BOOL animated) {
-            ((void(*)(id, SEL, BOOL))orig)(self, @selector(viewDidAppear:), animated);
-            @try {
-                UIViewController *vc = (id)self;
-                if (vc.navigationController) {
-                    FBSInstallOnNav(vc.navigationController);
-                }
-            } @catch (__unused NSException *e) {}
-        }));
-    }
-}
-
-static void FBSInstall(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        // hook标准UINavigationController
-        FBSHookPushForClass([UINavigationController class]);
-        // hook微信自定义的MMUINavigationController
-        Class mmNavCls = NSClassFromString(@"MMUINavigationController");
-        if (mmNavCls) {
-            FBSHookPushForClass(mmNavCls);
-        }
-        FBSHookViewDidAppear();
-        
-        // 遍历所有window装手势
-        for (UIWindowScene *s in [UIApplication sharedApplication].connectedScenes) {
-            if (![s isKindOfClass:[UIWindowScene class]]) continue;
-            for (UIWindow *w in s.windows) {
-                if (w.rootViewController) {
-                    NSMutableArray *queue = [NSMutableArray arrayWithObject:w.rootViewController];
-                    while (queue.count > 0) {
-                        UIViewController *vc = queue.firstObject;
-                        [queue removeObjectAtIndex:0];
-                        if ([vc isKindOfClass:[UINavigationController class]]) {
-                            FBSInstallOnNav((id)vc);
-                        }
-                        for (UIViewController *c in vc.childViewControllers) {
-                            [queue addObject:c];
-                        }
-                    }
+    @try {
+        Class itc = NSClassFromString(@"_UINavigationInteractiveTransition");
+        if (itc) {
+            for (UIGestureRecognizer *gr in nav.view.gestureRecognizers) {
+                id targets = nil;
+                @try { targets = [gr valueForKey:@"_targets"]; } @catch (__unused NSException *e) { }
+                for (id wrapper in targets) {
+                    id t = nil;
+                    @try { t = [wrapper valueForKey:@"_target"]; } @catch (__unused NSException *e) { }
+                    if (!t) t = wrapper;
+                    if ([t isKindOfClass:itc]) return t;
                 }
             }
+        }
+    } @catch (__unused NSException *e) { }
+
+    return nil;
+}
+
+// -------------------- 安装（幂等，target 拿不到则不装） --------------------
+static void FSBInstallOnNav(UINavigationController *nav) {
+    if (!nav || ![nav isKindOfClass:[UINavigationController class]]) return;
+    UIView *host = nav.view;
+    if (!host) return;
+    if (nav.viewControllers.count < 2) return;
+
+    for (UIGestureRecognizer *g in host.gestureRecognizers) {
+        if ([g isMemberOfClass:[FSBFullScreenPan class]]) return;   // 已装
+    }
+
+    id target = FSBSystemTransitionTarget(nav);
+    if (!target || ![target respondsToSelector:NSSelectorFromString(@"handleNavigationTransition:")]) return;
+
+    FSBFullScreenPan *pan = [[FSBFullScreenPan alloc] initWithTarget:target
+                                                              action:NSSelectorFromString(@"handleNavigationTransition:")];
+    pan.delegate = [FSBGestureDelegate shared];
+    pan.maximumNumberOfTouches = 1;
+    pan.minimumNumberOfTouches = 1;
+    pan.cancelsTouchesInView = NO;
+    pan.delaysTouchesBegan = NO;
+    [pan addTarget:[FSBHaptics shared] action:@selector(trackGesture:)];
+    [host addGestureRecognizer:pan];
+}
+
+// -------------------- 全量遍历安装 --------------------
+static void FSBWalk(UIViewController *vc) {
+    if (!vc) return;
+    if ([vc isKindOfClass:[UINavigationController class]]) FSBInstallOnNav((UINavigationController *)vc);
+    if ([vc isKindOfClass:[UITabBarController class]]) {
+        for (UIViewController *c in ((UITabBarController *)vc).viewControllers) FSBWalk(c);
+    }
+    if ([vc isKindOfClass:[UISplitViewController class]]) {
+        for (UIViewController *c in ((UISplitViewController *)vc).viewControllers) FSBWalk(c);
+    }
+    for (UIViewController *c in vc.childViewControllers) FSBWalk(c);
+    if (vc.presentedViewController) FSBWalk(vc.presentedViewController);
+}
+
+static void FSBInstallAll(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIApplication *app = [UIApplication sharedApplication];
+        if (@available(iOS 13.0, *)) {
+            for (UIScene *scene in app.connectedScenes) {
+                if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+                for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                    if (w.rootViewController) FSBWalk(w.rootViewController);
+                }
+            }
+        } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            for (UIWindow *w in app.windows) if (w.rootViewController) FSBWalk(w.rootViewController);
+#pragma clang diagnostic pop
         }
     });
 }
 
-__attribute__((constructor)) static void WXConstructor(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ FBSInstall(); });
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n){ FBSInstall(); }];
+// -------------------- Hook（runtime swizzle，无 Logos） --------------------
+typedef struct { Class cls; SEL sel; IMP orig; } FSBSwizzle;
+
+static FSBSwizzle gSwizzle[8];
+static int gSwizzleCount = 0;
+
+static FSBSwizzle *FSBSwizzleMethod(Class cls, SEL sel, IMP newImp) {
+    if (!cls || !sel || !newImp) return NULL;
+    if (gSwizzleCount >= 8) return NULL;
+    FSBSwizzle *slot = &gSwizzle[gSwizzleCount++];
+    slot->cls = cls;
+    slot->sel = sel;
+    slot->orig = NULL;
+
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) {
+        class_addMethod(cls, sel, newImp, "@@:");
+        return slot;
+    }
+    slot->orig = method_getImplementation(m);
+    class_replaceMethod(cls, sel, newImp, method_getTypeEncoding(m));
+    return slot;
+}
+
+#define SW_NAV_PUSH          0
+#define SW_VC_VIEWDIDAPPEAR  1
+
+static void FSB_UINavigationController_pushViewController(id self, SEL _cmd, UIViewController *vc, BOOL animated) {
+    IMP o = gSwizzle[SW_NAV_PUSH].orig;
+    if (o) ((void (*)(id, SEL, id, BOOL))o)(self, _cmd, vc, animated);
+    FSBInstallOnNav(self);
+}
+static void FSB_UIViewController_viewDidAppear(id self, SEL _cmd, BOOL animated) {
+    IMP o = gSwizzle[SW_VC_VIEWDIDAPPEAR].orig;
+    if (o) ((void (*)(id, SEL, BOOL))o)(self, _cmd, animated);
+    UINavigationController *nav = ((UIViewController *)self).navigationController;
+    if (nav) FSBInstallOnNav(nav);
+}
+
+__attribute__((constructor)) static void FSBEntry(void) {
+    @autoreleasepool {
+        Class navCls = objc_getClass("UINavigationController");
+        Class vcCls  = objc_getClass("UIViewController");
+        gSwizzleCount = 0;
+        FSBSwizzleMethod(navCls, sel_registerName("pushViewController:animated:"), (IMP)FSB_UINavigationController_pushViewController);
+        FSBSwizzleMethod(vcCls, sel_registerName("viewDidAppear:"), (IMP)FSB_UIViewController_viewDidAppear);
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ FSBInstallAll(); });
+    }
 }
