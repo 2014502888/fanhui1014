@@ -42,8 +42,14 @@
             CGFloat w = host ? host.bounds.size.width : 0.0;
             CGFloat tx = [g translationInView:host].x;
             CGFloat vx = [g velocityInView:host].x;
-            BOOL passed = (w > 0.0 && tx > w * 0.35) || (vx > 320.0 && tx > 8.0);
-            if (passed) [_gen impactOccurredWithIntensity:1.0];
+            // 达标：滑过屏宽35% 或 快速右滑
+            BOOL passed = (w > 0.0 && tx > w * 0.35) || vx > 300.0;
+            if (passed) {
+                // 新建即触发，不依赖 Began 时 prepare 的时效（慢滑超时会导致不震）
+                UIImpactFeedbackGenerator *g2 =
+                    [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleHeavy];
+                [g2 impactOccurredWithIntensity:1.0];
+            }
             _gen = nil;
             break;
         }
