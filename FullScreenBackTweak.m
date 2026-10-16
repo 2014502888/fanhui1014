@@ -150,7 +150,6 @@ static FSBHorizontalState FSBHasHorizontalGestures(UIView *view, CGPoint *point)
 @property (nonatomic, strong) FSBEdgeWidth *edgeWidth;
 @property (nonatomic, copy) FSBDirections (^allowedDirectionsBlock)(CGPoint point);
 @property (nonatomic, readonly) FSBDirections currentAllowedDirections;
-- (void)cancelGesture;
 @end
 
 @implementation FSBInteractivePan {
@@ -173,10 +172,6 @@ static FSBHorizontalState FSBHasHorizontalGestures(UIView *view, CGPoint *point)
     [super reset];
     _validatedGesture = NO;
     _currentAllowedDirections = 0;
-}
-
-- (void)cancelGesture {
-    self.state = UIGestureRecognizerStateCancelled;
 }
 
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
